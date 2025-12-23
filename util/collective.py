@@ -1,0 +1,318 @@
+import torch
+from torch.utils import data
+import torchvision.models as models
+import torchvision.transforms as transforms
+import cv2 as cv
+import random
+from PIL import Image
+import numpy as np
+
+from collections import Counter
+from skimage.util import random_noise  # 添加噪声模块
+from .data_augmentation import random_crop, random_flip, random_rotation, random_color
+
+FRAMES_NUM = {1: 302, 2: 347, 3: 194, 4: 257, 5: 536, 6: 401, 7: 968, 8: 221, 9: 356, 10: 302, 11: 1813, 12: 1084,
+              13: 851, 14: 723, 15: 464, 16: 1021, 17: 905, 18: 600, 19: 203, 20: 342, 21: 650, 22: 361, 23: 311,
+              24: 321, 25: 617, 26: 734, 27: 1804, 28: 470, 29: 635, 30: 356, 31: 690, 32: 194, 33: 193, 34: 395,
+              35: 707, 36: 914, 37: 1049, 38: 653, 39: 518, 40: 401, 41: 707, 42: 420, 43: 410, 44: 356, 45: 151,
+              46: 174, 47: 218, 48: 47, 49: 223, 50: 365, 51: 362, 52: 781, 53: 401, 54: 486, 55: 695, 56: 462,
+              57: 443, 58: 629, 59: 899, 60: 550, 61: 373, 62: 200, 63: 433, 64: 319, 65: 443, 66: 315, 67: 391,
+              68: 945, 69: 1011, 70: 449, 71: 351, 72: 751, 73: 325, 74: 400}
+
+FRAMES_SIZE = {1: (480, 720), 2: (480, 720), 3: (480, 720), 4: (480, 720), 5: (480, 720), 6: (480, 720), 7: (480, 720),
+               8: (480, 720), 9: (480, 720), 10: (480, 720), 11: (480, 720), 12: (480, 720), 13: (480, 720),
+               14: (480, 720),
+               15: (450, 800), 16: (480, 720), 17: (480, 720), 18: (480, 720), 19: (480, 720), 20: (450, 800),
+               21: (450, 800),
+               22: (450, 800), 23: (450, 800), 24: (450, 800), 25: (480, 720), 26: (480, 720), 27: (480, 720),
+               28: (480, 720),
+               29: (480, 720), 30: (480, 720), 31: (480, 720), 32: (480, 720), 33: (480, 720), 34: (480, 720),
+               35: (480, 720),
+               36: (480, 720), 37: (480, 720), 38: (480, 720), 39: (480, 720), 40: (480, 720), 41: (480, 720),
+               42: (480, 720),
+               43: (480, 720), 44: (480, 720), 45: (480, 640), 46: (480, 640), 47: (480, 640), 48: (480, 640),
+               49: (480, 640),
+               50: (480, 640), 51: (480, 640), 52: (480, 640), 53: (480, 640), 54: (480, 640), 55: (480, 640),
+               56: (480, 640),
+               57: (480, 640), 58: (480, 640), 59: (480, 640), 60: (720, 1280), 61: (720, 1280), 62: (720, 1280),
+               63: (720, 1280),
+               64: (720, 1280), 65: (720, 1280), 66: (720, 1280), 67: (720, 1280), 68: (720, 1280), 69: (720, 1280),
+               70: (720, 1280),
+               71: (720, 1280), 72: (720, 1280), 73: (720, 1280), 74: (720, 1280)}
+
+ACTIONS = ['NA', 'Crossing', 'Waiting', 'Queueing', 'Walking', 'Talking']
+ACTIVITIES = ['Crossing', 'Waiting', 'Queueing', 'Walking', 'Talking']
+
+# ACTIONS=['NA','Crossing','Waiting','Queueing','Walking','Talking','Dancing','Jogging']
+# ACTIVITIES=['Crossing','Waiting','Queueing','Walking','Talking','Dancing','Jogging']
+ACTIONS_ID = {a: i for i, a in enumerate(ACTIONS)}
+ACTIVITIES_ID = {a: i for i, a in enumerate(ACTIVITIES)}
+
+
+# 读取标签文件信息
+def collective_read_annotations(path, sid):
+    annotations = {}
+    path = path + '/seq%02d/annotations_sc.txt' % sid
+    with open(path, mode='r') as f:
+        frame_id = None  # 用来记录那一帧
+        group_activity = None
+        actions = []
+        bboxes = []
+        groups = []
+        groupId = []
+        for l in f.readlines():
+            # 0帧数 1x 2y 3w 4h 5action 6activite 7group 8ID 9groupID
+            values = l[:-1].split(' ')
+            # values = l[:-1].split(' ')  # 帧序列编号+行人边界框+人群分类
+            # 用于统计每一帧中的信息
+            if int(values[0]) != frame_id:
+                if frame_id != None and frame_id % 10 == 1 and frame_id + 9 <= FRAMES_NUM[sid]:
+                    # 计算a中每个元素的数量，按数量从大到小输出  如果most_common()的参数是2，则获取数量排在前两位的元素及具体数量
+                    counter = Counter(actions).most_common(2)
+
+                    group_activity = counter[0][0] - 1 if counter[0][0] != 0 else counter[1][0] - 1
+                    annotations[frame_id] = {
+                        'frame_id': frame_id,
+                        'group_activity': group_activity,
+                        'groupId': groupId,
+                        'actions': actions,
+                        'groups': groups,
+                        'bboxes': bboxes
+                    }
+                frame_id = int(values[0])
+                group_activity = None
+                groupId = []
+                groups = []
+                actions = []
+                bboxes = []
+
+            # if int(values[5])-1 == 4:
+            #     actions.append(1)
+            # elif int(values[5])-1 == 5:
+            #     actions.append(4)
+            # else:
+            #     actions.append(int(values[5])-1)
+            groupId.append(int(values[9]) - 1)
+            groups.append(int(values[7]) - 1)
+            actions.append(int(values[5]) - 1)  # 群体行为
+            x, y, w, h = (int(values[i]) for i in range(1, 5))  # 边界框
+            H, W = FRAMES_SIZE[sid]  # 高宽
+            bboxes.append((y / H, x / W, (y + h) / H, (x + w) / W))
+
+        # 这一部分起什么作用暂时不知道？？？？？？？？？？？
+        if frame_id != None and frame_id % 10 == 1 and frame_id + 9 <= FRAMES_NUM[sid]:
+            counter = Counter(actions).most_common(2)
+            group_activity = counter[0][0] - 1 if counter[0][0] != 0 else counter[1][0] - 1
+            annotations[frame_id] = {
+                'frame_id': frame_id,
+                'group_activity': group_activity,
+                'groupId': groupId,
+                'actions': actions,
+                'groups': groups,
+                'bboxes': bboxes
+            }
+    return annotations
+
+
+def collective_read_dataset(path, seqs):
+    data = {}
+    for sid in seqs:
+        data[sid] = collective_read_annotations(path, sid)
+    return data
+
+
+# 读取每个序列中的所有帧数
+def collective_all_frames(anns):
+    # anns 是字典  生成一个元组（ 视频序列号， 对应视频序列中的所有取出帧 ）
+    return [(s, f) for s in anns for f in anns[s]]
+
+
+# 读取视频帧信息
+class CollectiveDataset(data.Dataset):
+    """
+    Characterize collective dataset for pytorch
+    """
+
+    def __init__(self, anns, frames, images_path, image_size, feature_size, num_boxes=13, num_frames=10,
+                 is_training=True, is_finetune=False):
+        self.anns = anns
+        self.frames = frames
+        self.images_path = images_path
+        self.image_size = image_size
+        self.feature_size = feature_size
+
+        self.num_boxes = num_boxes
+        self.num_frames = num_frames
+
+        self.is_training = is_training
+        self.is_finetune = is_finetune
+
+    def __len__(self):
+        """
+        Return the total number of samples
+        """
+        return len(self.frames)
+
+    def __getitem__(self, index):
+        """
+        Generate one sample of the dataset
+        """
+        select_frames = self.get_frames(self.frames[index])
+        sample = self.load_samples_sequence(index, select_frames)
+        return sample
+
+    def get_frames(self, frame):
+
+        sid, src_fid = frame  # 序列数， 第几帧
+
+        self.is_finetune = False
+        if self.is_finetune:  # True
+            if self.is_training:
+                fid = random.randint(src_fid,
+                                     src_fid + self.num_frames - 1)  # 从src_fid, src_fid+self.num_frames-1中随机取一帧
+                return [(sid, src_fid, fid)]
+
+            else:
+                return [(sid, src_fid, fid)
+                        for fid in range(src_fid, src_fid + self.num_frames)]
+
+        else:
+            if self.is_training:
+                sample_frames = random.sample(range(src_fid, src_fid + self.num_frames), 10)
+                sample_frames = sorted(sample_frames)
+                return [(sid, src_fid, fid) for fid in sample_frames]
+            else:
+                sample_frames = random.sample(range(src_fid, src_fid + self.num_frames), 10)
+                sample_frames = sorted(sample_frames)
+                return [(sid, src_fid, fid) for fid in sample_frames]
+
+    def load_samples_sequence(self, index, select_frames):
+        """
+        load samples sequence
+
+        Returns:
+            pytorch tensors
+        """
+
+        OH, OW = self.feature_size  # 57, 87
+        images, bboxes = [], []
+        activities, actions = [], []
+        bboxes_num = []
+        frames = []
+        groups = []
+        groupId = []
+        for i, (sid, src_fid, fid) in enumerate(select_frames):
+
+            # print(self.images_path + '/seq%02d/frame%04d.jpg' % (sid, fid))
+            frames.append((sid, src_fid, fid))
+            img = Image.open(self.images_path + '/seq%02d/frame%04d.jpg' % (sid, fid))
+
+            img = transforms.functional.resize(img, self.image_size)
+            img = np.array(img)
+
+            if self.is_training and src_fid > self.__len__() / 2:
+                H, W = FRAMES_SIZE[sid]  # 高宽
+
+                temp_boxes = []
+                for box in self.anns[sid][src_fid]['bboxes']:
+                    y1, x1, y2, x2 = box
+                    w1, h1, w2, h2 = x1 * W, y1 * H, x2 * W, y2 * H
+                    temp_boxes.append([w1, h1, w2, h2])
+                boxes = temp_boxes
+                boxes = np.array(boxes)
+
+                labels = self.anns[sid][src_fid]['actions'][:]
+                labels = np.array(labels, dtype=np.int32)
+
+                # 随机裁剪
+                # img, boxes, labels = random_crop(img, boxes, labels)
+
+                # 随机翻转
+                # img, boxes, labels = random_flip(img, boxes, labels)
+
+                # 随机旋转
+                # img, boxes, labels = random_rotation(img, boxes, labels)
+                temp_actions = labels.tolist()
+
+                # 随机色调调整
+                # img = random_color(img)
+
+                temp_boxes = []
+                for i, box in enumerate(boxes):
+                    x1, y1, x2, y2 = box
+                    w1, h1, w2, h2 = x1 / W * OW, y1 / H * OH, x2 / W * OW, y2 / H * OH
+                    temp_boxes.append((w1, h1, w2, h2))
+
+            else:
+                temp_boxes = []
+                for box in self.anns[sid][src_fid]['bboxes']:
+                    y1, x1, y2, x2 = box
+                    w1, h1, w2, h2 = x1 * OW, y1 * OH, x2 * OW, y2 * OH
+                    temp_boxes.append((w1, h1, w2, h2))
+                temp_actions = self.anns[sid][src_fid]['actions'][:]
+            temp_groups = self.anns[sid][src_fid]['groups'][:]
+            temp_groupId = self.anns[sid][src_fid]['groupId'][:]
+            # H,W,3 -> 3,H,W
+            img = img.transpose(2, 0, 1)
+            images.append(img)
+            bboxes_num.append(len(temp_boxes))
+
+
+            # print("temp_actions:", temp_actions)
+            # print("temp_groups:", temp_groups)
+            # print("temp_groupId:",temp_groupId)
+            while len(temp_boxes) != self.num_boxes:
+                temp_boxes.append((0, 0, 0, 0))
+                temp_actions.append(-1)
+                temp_groups.append(-1)
+                temp_groupId.append(-1)
+            bboxes.append(temp_boxes)
+            actions.append(temp_actions)
+            groups.append(temp_groups)
+            groupId.append(temp_groupId)
+            activities.append(self.anns[sid][src_fid]['group_activity'])
+
+            # print(fid)
+            # print(bboxes_num)
+            # with open(self.images_path + '/seq%02d/annotations_sc.txt' % sid, mode='r') as f:
+            #     groupId = []
+            #     grouplabel =[]
+            #     for l in f.readlines():
+            #         values = l[:-1].split(' ')
+            #         if int(values[0]) == fid:
+            #             groupId.append(int(values[9]))
+            #             grouplabel.append(int(values[7]))
+            #             # print("l:",sid, fid, values[9])
+            #     # print("aa:", groupId)
+            #
+            #     while len(groupId) != self.num_boxes:
+            #         groupId.append(0)
+            #         grouplabel.append(0)
+            #     # print("aa:", groupId)
+            #     grouptensor = torch.tensor(groupId)
+            #     groupLabelTensor = torch.tensor(grouplabel)
+            #     # if groupId != 0:
+            #     #     # groupId_tensor = torch.tensor(groupId)
+            #
+            # groupInfo.append(grouptensor)
+            # group.append(groupLabelTensor)
+
+        images = np.stack(images)
+        activities = np.array(activities, dtype=np.int32)
+        bboxes_num = np.array(bboxes_num, dtype=np.int32)
+        bboxes = np.array(bboxes, dtype=np.float32).reshape(-1, self.num_boxes, 4)
+        actions = np.array(actions, dtype=np.int32).reshape(-1, self.num_boxes)
+        groups = np.array(groups, dtype=np.int32).reshape(-1, self.num_boxes)
+        groupId = np.array(groupId, dtype=np.int32).reshape(-1, self.num_boxes)
+        frames = np.array(frames, dtype=np.int32)
+
+        # convert to pytorch tensor
+        images = torch.from_numpy(images).float()
+        bboxes = torch.from_numpy(bboxes).float()
+        actions = torch.from_numpy(actions).long()
+        groups = torch.from_numpy(groups).long()
+        groupId = torch.from_numpy(groupId).long()
+        activities = torch.from_numpy(activities).long()
+        bboxes_num = torch.from_numpy(bboxes_num).int()
+        frames = torch.from_numpy(frames)
+        return images, bboxes, actions, activities, bboxes_num, frames, groupId,groups
